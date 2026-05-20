@@ -26,6 +26,7 @@ use pgwire::types::format::FormatOptions;
 
 use crate::hooks::QueryHook;
 use crate::hooks::cursor::CursorStatementHook;
+use crate::hooks::prepare_execute::PrepareExecuteHook;
 use crate::hooks::set_show::SetShowHook;
 use crate::hooks::transactions::TransactionStatementHook;
 use crate::{client, planner};
@@ -126,6 +127,7 @@ pub struct DfSessionService {
 impl DfSessionService {
     pub fn new(session_context: Arc<SessionContext>) -> DfSessionService {
         let hooks: Vec<Arc<dyn QueryHook>> = vec![
+            Arc::new(PrepareExecuteHook),
             Arc::new(CursorStatementHook),
             Arc::new(SetShowHook),
             Arc::new(TransactionStatementHook),

@@ -1,5 +1,6 @@
 pub mod cursor;
 pub mod permissions;
+pub mod prepare_execute;
 pub mod set_show;
 pub mod transactions;
 
