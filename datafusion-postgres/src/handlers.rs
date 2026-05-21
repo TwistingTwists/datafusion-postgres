@@ -1,13 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::ParamValues;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::*;
 use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser;
+use datafusion::sql::sqlparser::ast::{Expr, ObjectName, ObjectNamePart, Value};
 use log::info;
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::auth::noop::NoopStartupHandler;
@@ -15,13 +17,14 @@ use pgwire::api::cancel::{CancelHandler, DefaultCancelHandler};
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{FieldInfo, Response, Tag};
-use pgwire::api::stmt::QueryParser;
-use pgwire::api::store::PortalStore;
+use pgwire::api::stmt::{QueryParser, StoredStatement};
+use pgwire::api::store::{MemPortalStore, PortalStore};
 use pgwire::api::{
     ClientInfo, ClientPortalStore, ConnectionManager, ErrorHandler, PgWireServerHandlers, Type,
 };
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
+use pgwire::messages::extendedquery::Bind;
 use pgwire::types::format::FormatOptions;
 
 use crate::hooks::QueryHook;
@@ -32,6 +35,13 @@ use crate::{client, planner};
 use arrow_pg::datatypes::df;
 use arrow_pg::datatypes::{arrow_schema_to_pg_fields, into_pg_type};
 use datafusion_pg_catalog::sql::PostgresCompatibilityParser;
+
+type DfStatement = (String, Option<(sqlparser::ast::Statement, LogicalPlan)>);
+
+#[derive(Default)]
+struct SimplePreparedStatements {
+    names: std::sync::RwLock<BTreeSet<String>>,
+}
 
 /// Simple startup handler that does no authentication
 pub struct SimpleStartupHandler {
@@ -148,11 +158,12 @@ impl DfSessionService {
             query_hooks,
         }
     }
-}
 
-#[async_trait]
-impl SimpleQueryHandler for DfSessionService {
-    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    async fn handle_simple_prepared_statement<C>(
+        &self,
+        client: &mut C,
+        statement: &sqlparser::ast::Statement,
+    ) -> PgWireResult<Option<Response>>
     where
         C: ClientInfo
             + ClientPortalStore
@@ -164,89 +175,144 @@ impl SimpleQueryHandler for DfSessionService {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as futures::Sink<PgWireBackendMessage>>::Error>,
     {
-        log::debug!("Received query: {query}");
+        match statement {
+            sqlparser::ast::Statement::Prepare {
+                name,
+                data_types,
+                statement,
+            } => self
+                .handle_simple_prepare(client, &name.value, data_types, statement)
+                .await
+                .map(Some),
+            sqlparser::ast::Statement::Execute {
+                name,
+                parameters,
+                immediate,
+                ..
+            } if !immediate => self
+                .handle_simple_execute(client, name.as_ref(), parameters)
+                .await
+                .map(Some),
+            sqlparser::ast::Statement::Deallocate { name, .. } => {
+                self.handle_simple_deallocate(client, &name.value).map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
 
-        let statements = self
+    async fn handle_simple_prepare<C>(
+        &self,
+        client: &C,
+        name: &str,
+        data_types: &[sqlparser::ast::DataType],
+        statement: &sqlparser::ast::Statement,
+    ) -> PgWireResult<Response>
+    where
+        C: ClientInfo + ClientPortalStore + Unpin + Send + Sync,
+        C::PortalStore: PortalStore,
+    {
+        let parameter_types = data_types
+            .iter()
+            .map(prepare_data_type_to_pg_type)
+            .collect::<PgWireResult<Vec<_>>>()?;
+        let query = statement.to_string();
+        let parsed = self
             .parser
-            .sql_parser
-            .parse(query)
-            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            .parse_sql(client, &query, &parameter_types)
+            .await?;
 
-        // empty query
-        if statements.is_empty() {
-            return Ok(vec![Response::EmptyQuery]);
-        }
-
-        let mut results = vec![];
-        'stmt: for statement in statements {
-            // Call query hooks with the parsed statement
-            for hook in &self.query_hooks {
-                if let Some(result) = hook
-                    .handle_simple_query(&statement, &self.session_context, client)
-                    .await
-                {
-                    results.push(result?);
-                    continue 'stmt;
-                }
-            }
-
-            let df_result = {
-                let query = statement.to_string();
-
-                let timeout = client::get_statement_timeout(client);
-                if let Some(timeout_duration) = timeout {
-                    tokio::time::timeout(timeout_duration, self.session_context.sql(&query))
-                        .await
-                        .map_err(|_| {
-                            PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
-                                "ERROR".to_string(),
-                                "57014".to_string(), // query_canceled error code
-                                "canceling statement due to statement timeout".to_string(),
-                            )))
-                        })?
-                } else {
-                    self.session_context.sql(&query).await
-                }
-            };
-
-            // Handle query execution errors and transaction state
-            let df = match df_result {
-                Ok(df) => df,
-                Err(e) => {
-                    return Err(PgWireError::ApiError(Box::new(e)));
-                }
-            };
-
-            if matches!(statement, sqlparser::ast::Statement::Insert(_)) {
-                let resp = map_rows_affected_for_insert(&df).await?;
-                results.push(resp);
-            } else {
-                // For non-INSERT queries, return a regular Query response
-                let format_options =
-                    Arc::new(FormatOptions::from_client_metadata(client.metadata()));
-                let resp =
-                    df::encode_dataframe(df, &Format::UnifiedText, Some(format_options)).await?;
-                results.push(Response::Query(resp));
+        if let (_, Some((_, plan))) = &parsed
+            && !parameter_types.is_empty()
+        {
+            let inferred = planner::get_inferred_parameter_types(plan)
+                .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+            if inferred.len() != parameter_types.len() {
+                return Err(user_error(
+                    "42601",
+                    format!(
+                        "PREPARE specifies {} data types but query has {} parameters",
+                        parameter_types.len(),
+                        inferred.len()
+                    ),
+                ));
             }
         }
-        Ok(results)
+
+        let store = typed_portal_store(client)?;
+        store.put_statement(Arc::new(StoredStatement::new(
+            name.to_string(),
+            parsed,
+            parameter_types,
+        )));
+        prepared_statement_registry(client)
+            .names
+            .write()
+            .unwrap()
+            .insert(name.to_string());
+
+        Ok(Response::Execution(Tag::new("PREPARE")))
     }
-}
 
-#[async_trait]
-impl ExtendedQueryHandler for DfSessionService {
-    type Statement = (String, Option<(sqlparser::ast::Statement, LogicalPlan)>);
-    type QueryParser = Parser;
-
-    fn query_parser(&self) -> Arc<Self::QueryParser> {
-        self.parser.clone()
-    }
-
-    async fn do_query<C>(
+    async fn handle_simple_execute<C>(
         &self,
         client: &mut C,
-        portal: &Portal<Self::Statement>,
-        _max_rows: usize,
+        name: Option<&ObjectName>,
+        parameters: &[Expr],
+    ) -> PgWireResult<Response>
+    where
+        C: ClientInfo
+            + ClientPortalStore
+            + futures::Sink<PgWireBackendMessage>
+            + Unpin
+            + Send
+            + Sync,
+        C::PortalStore: PortalStore,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as futures::Sink<PgWireBackendMessage>>::Error>,
+    {
+        let name = name
+            .map(prepared_statement_name)
+            .ok_or_else(|| user_error("42601", "EXECUTE requires a prepared statement name"))?;
+        let statement = typed_portal_store(client)?
+            .get_statement(&name)
+            .ok_or_else(|| prepared_statement_missing(&name))?;
+        let parameters = parameters
+            .iter()
+            .map(simple_execute_parameter)
+            .collect::<PgWireResult<Vec<_>>>()?;
+
+        let bind = Bind::new(None, Some(name), vec![], parameters, vec![]);
+        let portal = Portal::try_new(&bind, statement)?;
+
+        self.execute_portal(client, &portal).await
+    }
+
+    fn handle_simple_deallocate<C>(&self, client: &C, name: &str) -> PgWireResult<Response>
+    where
+        C: ClientInfo + ClientPortalStore,
+        C::PortalStore: PortalStore,
+    {
+        let store = typed_portal_store(client)?;
+        let registry = prepared_statement_registry(client);
+
+        if name.eq_ignore_ascii_case("ALL") {
+            let mut names = registry.names.write().unwrap();
+            for name in names.iter() {
+                store.rm_statement(name);
+            }
+            names.clear();
+        } else {
+            store.rm_statement(name);
+            registry.names.write().unwrap().remove(name);
+        }
+
+        Ok(Response::Execution(Tag::new("DEALLOCATE")))
+    }
+
+    async fn execute_portal<C>(
+        &self,
+        client: &mut C,
+        portal: &Portal<DfStatement>,
     ) -> PgWireResult<Response>
     where
         C: ClientInfo
@@ -351,6 +417,257 @@ impl ExtendedQueryHandler for DfSessionService {
     }
 }
 
+fn typed_portal_store<C>(client: &C) -> PgWireResult<&MemPortalStore<DfStatement>>
+where
+    C: ClientPortalStore,
+    C::PortalStore: PortalStore,
+{
+    client
+        .portal_store()
+        .as_any()
+        .downcast_ref::<MemPortalStore<DfStatement>>()
+        .ok_or_else(|| user_error("XX000", "portal store is not MemPortalStore<DfStatement>"))
+}
+
+fn prepared_statement_registry<C>(client: &C) -> Arc<SimplePreparedStatements>
+where
+    C: ClientInfo,
+{
+    client
+        .session_extensions()
+        .get_or_insert_with(SimplePreparedStatements::default)
+}
+
+fn prepared_statement_name(name: &ObjectName) -> String {
+    if let [ObjectNamePart::Identifier(ident)] = name.0.as_slice() {
+        ident.value.clone()
+    } else {
+        name.to_string()
+    }
+}
+
+fn prepare_data_type_to_pg_type(
+    data_type: &sqlparser::ast::DataType,
+) -> PgWireResult<Option<Type>> {
+    let pg_type = match data_type {
+        sqlparser::ast::DataType::Bool | sqlparser::ast::DataType::Boolean => Type::BOOL,
+        sqlparser::ast::DataType::Char(_)
+        | sqlparser::ast::DataType::Character(_)
+        | sqlparser::ast::DataType::CharVarying(_)
+        | sqlparser::ast::DataType::CharacterVarying(_)
+        | sqlparser::ast::DataType::Varchar(_)
+        | sqlparser::ast::DataType::String(_)
+        | sqlparser::ast::DataType::Text => Type::TEXT,
+        sqlparser::ast::DataType::TinyInt(_)
+        | sqlparser::ast::DataType::Int2(_)
+        | sqlparser::ast::DataType::SmallInt(_)
+        | sqlparser::ast::DataType::Int16 => Type::INT2,
+        sqlparser::ast::DataType::Int(_)
+        | sqlparser::ast::DataType::Int4(_)
+        | sqlparser::ast::DataType::Integer(_)
+        | sqlparser::ast::DataType::Int32 => Type::INT4,
+        sqlparser::ast::DataType::BigInt(_)
+        | sqlparser::ast::DataType::Int8(_)
+        | sqlparser::ast::DataType::Int64 => Type::INT8,
+        sqlparser::ast::DataType::Float4
+        | sqlparser::ast::DataType::Float32
+        | sqlparser::ast::DataType::Real => Type::FLOAT4,
+        sqlparser::ast::DataType::Float(_)
+        | sqlparser::ast::DataType::Float8
+        | sqlparser::ast::DataType::Float64
+        | sqlparser::ast::DataType::Double(_)
+        | sqlparser::ast::DataType::DoublePrecision => Type::FLOAT8,
+        sqlparser::ast::DataType::Numeric(_)
+        | sqlparser::ast::DataType::Decimal(_)
+        | sqlparser::ast::DataType::Dec(_) => Type::NUMERIC,
+        sqlparser::ast::DataType::Date => Type::DATE,
+        sqlparser::ast::DataType::Time(_, _) => Type::TIME,
+        sqlparser::ast::DataType::Timestamp(_, _) | sqlparser::ast::DataType::TimestampNtz(_) => {
+            Type::TIMESTAMP
+        }
+        sqlparser::ast::DataType::Bytea => Type::BYTEA,
+        unsupported => {
+            return Err(user_error(
+                "0A000",
+                format!("unsupported PREPARE parameter type: {unsupported}"),
+            ));
+        }
+    };
+
+    Ok(Some(pg_type))
+}
+
+fn simple_execute_parameter(expr: &Expr) -> PgWireResult<Option<Bytes>> {
+    match expr {
+        Expr::Value(value) => value_to_parameter(&value.value),
+        Expr::TypedString(typed) => value_to_parameter(&typed.value.value),
+        unsupported => Err(user_error(
+            "0A000",
+            format!("unsupported EXECUTE parameter expression: {unsupported}"),
+        )),
+    }
+}
+
+fn value_to_parameter(value: &Value) -> PgWireResult<Option<Bytes>> {
+    let text = match value {
+        Value::Null => return Ok(None),
+        Value::Number(value, _) => value.to_string(),
+        Value::Boolean(value) => value.to_string(),
+        Value::SingleQuotedString(value)
+        | Value::DollarQuotedString(sqlparser::ast::DollarQuotedString { value, .. })
+        | Value::TripleSingleQuotedString(value)
+        | Value::TripleDoubleQuotedString(value)
+        | Value::EscapedStringLiteral(value)
+        | Value::UnicodeStringLiteral(value)
+        | Value::DoubleQuotedString(value)
+        | Value::NationalStringLiteral(value) => value.clone(),
+        unsupported => {
+            return Err(user_error(
+                "0A000",
+                format!("unsupported EXECUTE parameter value: {unsupported}"),
+            ));
+        }
+    };
+
+    Ok(Some(Bytes::from(text)))
+}
+
+fn prepared_statement_missing(name: &str) -> PgWireError {
+    user_error(
+        "26000",
+        format!("prepared statement \"{name}\" does not exist"),
+    )
+}
+
+fn user_error(sqlstate: &str, message: impl Into<String>) -> PgWireError {
+    PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
+        "ERROR".to_string(),
+        sqlstate.to_string(),
+        message.into(),
+    )))
+}
+
+#[async_trait]
+impl SimpleQueryHandler for DfSessionService {
+    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    where
+        C: ClientInfo
+            + ClientPortalStore
+            + futures::Sink<PgWireBackendMessage>
+            + Unpin
+            + Send
+            + Sync,
+        C::PortalStore: PortalStore,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as futures::Sink<PgWireBackendMessage>>::Error>,
+    {
+        log::debug!("Received query: {query}");
+
+        let statements = self
+            .parser
+            .sql_parser
+            .parse(query)
+            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+
+        // empty query
+        if statements.is_empty() {
+            return Ok(vec![Response::EmptyQuery]);
+        }
+
+        let mut results = vec![];
+        'stmt: for statement in statements {
+            if let Some(result) = self
+                .handle_simple_prepared_statement(client, &statement)
+                .await?
+            {
+                results.push(result);
+                continue 'stmt;
+            }
+
+            // Call query hooks with the parsed statement
+            for hook in &self.query_hooks {
+                if let Some(result) = hook
+                    .handle_simple_query(&statement, &self.session_context, client)
+                    .await
+                {
+                    results.push(result?);
+                    continue 'stmt;
+                }
+            }
+
+            let df_result = {
+                let query = statement.to_string();
+
+                let timeout = client::get_statement_timeout(client);
+                if let Some(timeout_duration) = timeout {
+                    tokio::time::timeout(timeout_duration, self.session_context.sql(&query))
+                        .await
+                        .map_err(|_| {
+                            PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
+                                "ERROR".to_string(),
+                                "57014".to_string(), // query_canceled error code
+                                "canceling statement due to statement timeout".to_string(),
+                            )))
+                        })?
+                } else {
+                    self.session_context.sql(&query).await
+                }
+            };
+
+            // Handle query execution errors and transaction state
+            let df = match df_result {
+                Ok(df) => df,
+                Err(e) => {
+                    return Err(PgWireError::ApiError(Box::new(e)));
+                }
+            };
+
+            if matches!(statement, sqlparser::ast::Statement::Insert(_)) {
+                let resp = map_rows_affected_for_insert(&df).await?;
+                results.push(resp);
+            } else {
+                // For non-INSERT queries, return a regular Query response
+                let format_options =
+                    Arc::new(FormatOptions::from_client_metadata(client.metadata()));
+                let resp =
+                    df::encode_dataframe(df, &Format::UnifiedText, Some(format_options)).await?;
+                results.push(Response::Query(resp));
+            }
+        }
+        Ok(results)
+    }
+}
+
+#[async_trait]
+impl ExtendedQueryHandler for DfSessionService {
+    type Statement = DfStatement;
+    type QueryParser = Parser;
+
+    fn query_parser(&self) -> Arc<Self::QueryParser> {
+        self.parser.clone()
+    }
+
+    async fn do_query<C>(
+        &self,
+        client: &mut C,
+        portal: &Portal<Self::Statement>,
+        _max_rows: usize,
+    ) -> PgWireResult<Response>
+    where
+        C: ClientInfo
+            + ClientPortalStore
+            + futures::Sink<PgWireBackendMessage>
+            + Unpin
+            + Send
+            + Sync,
+        C::PortalStore: PortalStore,
+        C::Error: std::fmt::Debug,
+        PgWireError: From<<C as futures::Sink<PgWireBackendMessage>>::Error>,
+    {
+        self.execute_portal(client, portal).await
+    }
+}
+
 async fn map_rows_affected_for_insert(df: &DataFrame) -> PgWireResult<Response> {
     // For INSERT queries, we need to execute the query to get the row count
     // and return an Execution response with the proper tag
@@ -383,7 +700,7 @@ pub struct Parser {
 
 #[async_trait]
 impl QueryParser for Parser {
-    type Statement = (String, Option<(sqlparser::ast::Statement, LogicalPlan)>);
+    type Statement = DfStatement;
 
     async fn parse_sql<C>(
         &self,
